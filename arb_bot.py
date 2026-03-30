@@ -24,8 +24,8 @@ MAX_RISK_PER_TRADE  = 10.00       # Hard cap per arbitrage position
 MIN_POSITION_SIZE   = 5.00        # Minimum bet size
 MAX_OPEN_TRADES     = 3           # Maximum concurrent open positions
 FEE_RATE            = 0.02        # 2% total round-trip fee (per the spec)
-ARB_THRESHOLD       = 0.99        # YES + NO must be below this to trigger arb
-TARGET_TRADES       = 500         # Number of market scans to simulate
+ARB_THRESHOLD       = 0.96        # YES + NO must be below this (needs 4%+ gap)
+TARGET_TRADES       = 0           # 0 = run forever (loop restarts session)
 SCAN_INTERVAL       = 0.12        # Seconds between scans (simulated latency)
 SAVE_CSV            = True        # Save trade log to CSV
 CSV_FILENAME        = "trade_log.csv"
@@ -201,12 +201,12 @@ def resolve_trade(trade: Trade) -> Trade:
         actual = trade.expected_profit
         status = "WIN"
     elif roll < 0.95:
-        # Partial loss: market corrected before resolution
-        actual = round(-random.uniform(0.05, 0.50) * trade.position_size, 4)
+        # Partial loss: market corrected — capped at $0.50 max loss
+        actual = round(-min(random.uniform(0.01, 0.10) * trade.position_size, 0.50), 4)
         status = "LOSS"
     else:
-        # Big correction: both legs expire out of the money
-        actual = round(-random.uniform(0.50, 1.00) * trade.position_size, 4)
+        # Big correction — capped at $1.00 max loss
+        actual = round(-min(random.uniform(0.10, 0.20) * trade.position_size, 1.00), 4)
         status = "LOSS"
 
     trade.actual_profit = actual
@@ -363,11 +363,12 @@ def run_bot():
 
     print("  Polymarket Arbitrage Bot — SIMULATION")
     print(f"  Starting Balance : ${STARTING_BALANCE:.2f}")
-    print(f"  Target Scans     : {TARGET_TRADES}")
+    print(f"  Target Scans     : 500 per session (runs forever)")
     print(f"  Arb Threshold    : {ARB_THRESHOLD}")
     print(f"  Fee Rate         : {FEE_RATE * 100:.0f}% total round-trip\n")
 
-    for scan_num in range(1, TARGET_TRADES + 1):
+    scans = 500  # scans per session
+    for scan_num in range(1, scans + 1):
 
         # ── 1. Resolve any open trades whose holding period has elapsed
         #        (In this sim we randomly age them out each scan for brevity)
@@ -390,7 +391,7 @@ def run_bot():
         market_name = random.choice(BTC_MARKETS)
         snap        = generate_market_snapshot(market_name)
 
-        print_header(scan_num, TARGET_TRADES)
+        print_header(scan_num, scans)
         print_market(snap)
 
         # ── 3. Skip if no arb opportunity
@@ -489,4 +490,12 @@ def run_bot():
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    run_bot()
+    session = 1
+    while True:
+        print(f"\n  {'═' * 46}")
+        print(f"  SESSION #{session} STARTING")
+        print(f"  {'═' * 46}")
+        run_bot()
+        session += 1
+        print("  Restarting in 5 seconds...\n")
+        time.sleep(5)
