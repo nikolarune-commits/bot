@@ -11,6 +11,7 @@ import random
 import time
 import csv
 import os
+import json
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
@@ -18,8 +19,7 @@ from typing import Optional
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-RANDOM_SEED         = 42          # For reproducibility
-STARTING_BALANCE    = 100.00      # Initial wallet balance in USD
+STARTING_BALANCE    = 100.00      # Initial wallet balance in USD (first run only)
 MAX_RISK_PER_TRADE  = 10.00       # Hard cap per arbitrage position
 MIN_POSITION_SIZE   = 5.00        # Minimum bet size
 MAX_OPEN_TRADES     = 3           # Maximum concurrent open positions
@@ -275,6 +275,8 @@ def print_resolution(trade: Trade):
 
 def print_session_summary(
     balance: float,
+    session_start_balance: float,
+    original_balance: float,
     all_trades: list[Trade],
     skipped: int,
     failed: int,
@@ -291,9 +293,9 @@ def print_session_summary(
     print(f"\n{'═' * 48}")
     print(f"  SESSION SUMMARY")
     print(f"{'═' * 48}")
-    print(f"  Final Balance   : ${balance:.2f}")
-    print(f"  Starting Balance: ${STARTING_BALANCE:.2f}")
-    print(f"  Net P&L         : ${balance - STARTING_BALANCE:+.2f}")
+    print(f"  Balance         : ${balance:.2f}")
+    print(f"  Session P&L     : ${balance - session_start_balance:+.2f}")
+    print(f"  All-time P&L    : ${balance - original_balance:+.2f}  (from ${original_balance:.2f})")
     print(f"{'─' * 48}")
     print(f"  Trades Executed : {len(closed)}")
     print(f"  Trades Skipped  : {skipped}")
@@ -310,14 +312,15 @@ def print_session_summary(
 # ─────────────────────────────────────────────
 
 def init_csv(path: str):
-    """Creates the CSV file and writes the header row."""
-    with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "trade_id", "market", "open_time", "close_time",
-            "yes_price", "no_price", "total", "position_size",
-            "expected_profit", "actual_profit", "slippage", "status", "reason",
-        ])
+    """Creates the CSV header only if the file doesn't exist yet (preserves history)."""
+    if not os.path.exists(path):
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "trade_id", "market", "open_time", "close_time",
+                "yes_price", "no_price", "total", "position_size",
+                "expected_profit", "actual_profit", "slippage", "status", "reason",
+            ])
 
 
 def append_csv(path: str, trade: Trade):
@@ -342,13 +345,34 @@ def append_csv(path: str, trade: Trade):
 
 
 # ─────────────────────────────────────────────
+# BALANCE PERSISTENCE
+# ─────────────────────────────────────────────
+
+STATE_FILE = "state.json"
+
+def load_state() -> dict:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE)
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {"balance": STARTING_BALANCE, "original_balance": STARTING_BALANCE, "total_sessions": 0}
+
+def save_state(balance: float, original_balance: float, total_sessions: int):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE)
+    with open(path, "w") as f:
+        json.dump({
+            "balance": balance,
+            "original_balance": original_balance,
+            "total_sessions": total_sessions,
+        }, f)
+
+
+# ─────────────────────────────────────────────
 # MAIN BOT LOOP
 # ─────────────────────────────────────────────
 
-def run_bot():
-    random.seed(RANDOM_SEED)
-
-    balance      = STARTING_BALANCE
+def run_bot(balance: float, original_balance: float) -> float:
+    session_start_balance = balance
     open_trades: list[Trade] = []
     all_trades:  list[Trade] = []
     trade_id_seq = 0
@@ -357,12 +381,11 @@ def run_bot():
     total_profit  = 0.0
 
     if SAVE_CSV:
-        csv_path = os.path.join(os.path.dirname(__file__), CSV_FILENAME)
+        csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CSV_FILENAME)
         init_csv(csv_path)
-        print(f"  CSV logging → {csv_path}\n")
 
     print("  Polymarket Arbitrage Bot — SIMULATION")
-    print(f"  Starting Balance : ${STARTING_BALANCE:.2f}")
+    print(f"  Starting Balance : ${balance:.2f}")
     print(f"  Target Scans     : 500 per session (runs forever)")
     print(f"  Arb Threshold    : {ARB_THRESHOLD}")
     print(f"  Fee Rate         : {FEE_RATE * 100:.0f}% total round-trip\n")
@@ -482,7 +505,8 @@ def run_bot():
             append_csv(csv_path, t)
 
     # ── SESSION SUMMARY
-    print_session_summary(balance, all_trades, skipped_count, failed_count)
+    print_session_summary(balance, session_start_balance, original_balance, all_trades, skipped_count, failed_count)
+    return balance
 
 
 # ─────────────────────────────────────────────
@@ -490,12 +514,16 @@ def run_bot():
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    session = 1
+    state = load_state()
+    session = state["total_sessions"] + 1
+    balance = state["balance"]
+
     while True:
         print(f"\n  {'═' * 46}")
-        print(f"  SESSION #{session} STARTING")
+        print(f"  SESSION #{session} STARTING  |  Balance: ${balance:.2f}")
         print(f"  {'═' * 46}")
-        run_bot()
+        balance = run_bot(balance, state["original_balance"])
+        save_state(balance, state["original_balance"], session)
         session += 1
         print("  Restarting in 5 seconds...\n")
         time.sleep(5)
