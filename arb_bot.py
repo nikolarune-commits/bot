@@ -1,8 +1,9 @@
 """
 Polymarket Paper Trading Bot
 =============================
-Uses REAL market data from Polymarket's public API.
-Trades are simulated (fake balance) — no real money moves.
+Real prices from Polymarket's public API.
+Strategy: buy underpriced sides of "Bitcoin Up or Down" markets.
+Balance is fake (paper trading) — no real money moves.
 """
 
 import random
@@ -18,329 +19,241 @@ from typing import Optional
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-STARTING_BALANCE    = 100.00      # Initial wallet balance in USD (first run only)
-MAX_RISK_PER_TRADE  = 10.00       # Hard cap per arbitrage position
-MIN_POSITION_SIZE   = 5.00        # Minimum bet size
-MAX_OPEN_TRADES     = 3           # Maximum concurrent open positions
-FEE_RATE            = 0.02        # 2% total round-trip fee (per the spec)
-ARB_THRESHOLD       = 0.96        # YES + NO must be below this (needs 4%+ gap)
-TARGET_TRADES       = 0           # 0 = run forever (loop restarts session)
-SCAN_INTERVAL       = 0.12        # Seconds between scans (simulated latency)
-SAVE_CSV            = True        # Save trade log to CSV
-CSV_FILENAME        = "trade_log.csv"
+STARTING_BALANCE   = 100.00   # Starting balance (first run only)
+MAX_BET_SIZE       = 8.00     # Max $ per trade
+MIN_BET_SIZE       = 3.00     # Min $ per trade
+MAX_OPEN_TRADES    = 3        # Max concurrent positions
+FEE_RATE           = 0.02     # 2% fee (matches real Polymarket)
+ENTRY_MIN_PRICE    = 0.28     # Don't buy below this (too risky)
+ENTRY_MAX_PRICE    = 0.48     # Only buy the cheaper/underpriced side
+SCAN_INTERVAL      = 2.0      # Seconds between scans
+SCANS_PER_SESSION  = 300      # ~10 min per session
+API_REFRESH_SCANS  = 30       # Re-fetch markets every N scans (~60s)
+SAVE_CSV           = True
+CSV_FILENAME       = "trade_log.csv"
+POLYMARKET_API     = "https://gamma-api.polymarket.com"
+STATE_FILE         = "state.json"
 
-POLYMARKET_API = "https://gamma-api.polymarket.com"
-CACHE_REFRESH_INTERVAL = 50   # re-fetch real markets every N scans
 
 # ─────────────────────────────────────────────
 # DATA STRUCTURES
 # ─────────────────────────────────────────────
 
 @dataclass
-class MarketSnapshot:
-    """Represents a single market's current state."""
+class Market:
+    """Live Polymarket market snapshot."""
+    market_id: str
     name: str
-    yes_price: float
-    no_price: float
-    total: float
-    liquidity: float          # Available USD liquidity in the order book
-    spread_gap: float         # 1.00 - total  (positive = arb opportunity)
-    timestamp: datetime = field(default_factory=datetime.now)
+    up_price: float     # "Yes" / Up price
+    down_price: float   # "No"  / Down price
+    liquidity: float
+    closed: bool = False
 
 
 @dataclass
 class Trade:
-    """Records an executed arbitrage trade."""
+    """A single paper trade."""
     trade_id: int
     market: str
-    yes_price: float
-    no_price: float
-    total: float
-    position_size: float
-    expected_profit: float
+    market_id: str
+    side: str           # "UP" or "DOWN"
+    entry_price: float  # price paid per share
+    shares: float       # units bought = bet_size / entry_price
+    bet_size: float     # USD staked
     actual_profit: Optional[float] = None
-    status: str = "OPEN"       # OPEN | WIN | LOSS | FAILED
+    status: str = "OPEN"
     open_time: datetime = field(default_factory=datetime.now)
     close_time: Optional[datetime] = None
-    slippage: float = 0.0
-    reason: Optional[str] = None
+    exit_price: float = 0.0
 
 
 # ─────────────────────────────────────────────
-# REAL MARKET DATA (POLYMARKET API)
+# POLYMARKET API
 # ─────────────────────────────────────────────
 
-_market_cache: list[dict] = []
+_market_cache: dict[str, Market] = {}
 _cache_last_scan: int = -9999
 
 
-def _refresh_market_cache() -> bool:
-    """Fetch live binary markets from Polymarket's public API."""
-    global _market_cache
+def _fetch_markets(include_closed: bool = False) -> dict[str, Market]:
+    """Fetch Bitcoin Up/Down markets from Polymarket API."""
+    results = {}
     try:
-        resp = requests.get(
-            f"{POLYMARKET_API}/markets",
-            params={"active": "true", "closed": "false", "limit": 100},
-            timeout=10,
-        )
+        params = {"limit": 100}
+        if not include_closed:
+            params["active"] = "true"
+            params["closed"] = "false"
+        else:
+            params["closed"] = "true"
+
+        resp = requests.get(f"{POLYMARKET_API}/markets", params=params, timeout=10)
         resp.raise_for_status()
-        raw = resp.json()
-        markets = []
-        for m in raw:
+
+        for m in resp.json():
             try:
-                outcomes = m.get("outcomes", [])
-                prices   = m.get("outcomePrices", [])
-                if isinstance(outcomes, str):
-                    outcomes = json.loads(outcomes)
-                if isinstance(prices, str):
-                    prices = json.loads(prices)
-                if len(outcomes) != 2 or len(prices) != 2:
-                    continue
                 question = m.get("question", "")
                 if "Bitcoin Up or Down" not in question:
                     continue
-                yes_p = float(prices[0])
-                no_p  = float(prices[1])
-                liq   = float(m.get("liquidity") or 0)
-                if not (0.01 <= yes_p <= 0.99 and 0.01 <= no_p <= 0.99):
+                outcomes = m.get("outcomes", [])
+                prices   = m.get("outcomePrices", [])
+                if isinstance(outcomes, str): outcomes = json.loads(outcomes)
+                if isinstance(prices,   str): prices   = json.loads(prices)
+                if len(prices) != 2:
                     continue
-                if liq < 10:
+                up_p   = float(prices[0])
+                down_p = float(prices[1])
+                liq    = float(m.get("liquidity") or 0)
+                mid    = str(m.get("id") or m.get("conditionId") or question)
+                if up_p < 0 or down_p < 0:
                     continue
-                markets.append({
-                    "name":      m.get("question", "Unknown")[:60],
-                    "yes_price": yes_p,
-                    "no_price":  no_p,
-                    "liquidity": liq,
-                })
+                results[mid] = Market(
+                    market_id  = mid,
+                    name       = question[:60],
+                    up_price   = up_p,
+                    down_price = down_p,
+                    liquidity  = liq,
+                    closed     = bool(m.get("closed", False)),
+                )
             except (ValueError, TypeError, KeyError):
                 continue
-        if markets:
-            _market_cache = markets
-            print(f"  [API] {len(markets)} Bitcoin Up/Down markets loaded from Polymarket")
-            return True
-        return False
     except Exception as e:
-        print(f"  [API] Fetch failed: {e} — using last cache")
-        return False
+        print(f"  [API] Fetch failed: {e}")
+    return results
 
 
-def generate_market_snapshot(scan_num: int) -> MarketSnapshot:
-    """Pick a real market from the cache; refresh cache every N scans."""
-    global _cache_last_scan
-
-    if scan_num - _cache_last_scan >= CACHE_REFRESH_INTERVAL or not _market_cache:
-        _refresh_market_cache()
+def refresh_cache(scan_num: int) -> dict[str, Market]:
+    """Refresh market cache every N scans. Also fetches closed markets for resolution."""
+    global _market_cache, _cache_last_scan
+    if scan_num - _cache_last_scan >= API_REFRESH_SCANS or not _market_cache:
+        active = _fetch_markets(include_closed=False)
+        closed = _fetch_markets(include_closed=True)
+        merged = {**closed, **active}   # active data wins on conflict
+        if merged:
+            _market_cache = merged
+            active_count = sum(1 for m in merged.values() if not m.closed)
+            print(f"  [API] {active_count} active Bitcoin Up/Down markets loaded")
         _cache_last_scan = scan_num
-
-    if _market_cache:
-        m     = random.choice(_market_cache)
-        yes   = round(m["yes_price"], 4)
-        no    = round(m["no_price"],  4)
-        total = round(yes + no, 4)
-        return MarketSnapshot(
-            name=m["name"],
-            yes_price=yes,
-            no_price=no,
-            total=total,
-            liquidity=round(m["liquidity"], 2),
-            spread_gap=round(1.0 - total, 4),
-        )
-
-    # Fallback: simulate if API is completely unavailable
-    yes = round(random.uniform(0.35, 0.65), 4)
-    no  = round(1.0 - yes + random.uniform(-0.004, 0.004), 4)
-    yes = max(0.01, min(0.99, yes))
-    no  = max(0.01, min(0.99, no))
-    return MarketSnapshot(
-        name="[OFFLINE] Simulated Market",
-        yes_price=yes,
-        no_price=no,
-        total=round(yes + no, 4),
-        liquidity=round(random.uniform(20, 500), 2),
-        spread_gap=round(1.0 - yes - no, 4),
-    )
+    return _market_cache
 
 
 # ─────────────────────────────────────────────
-# SLIPPAGE & FAILURE SIMULATOR
+# TRADING SIGNAL
 # ─────────────────────────────────────────────
 
-def simulate_execution(snapshot: MarketSnapshot, position_size: float):
+def find_signal(market: Market) -> Optional[tuple[str, float]]:
     """
-    Determines whether a trade executes cleanly, slips, or fails outright.
-
-    Returns (success: bool, fill_price_yes, fill_price_no, reason)
+    Returns (side, price) to buy, or None if no signal.
+    Strategy: buy the cheaper side when it's in the value zone.
+    Lower price = bigger payout if correct, but harder to win.
+    Only trade liquid markets.
     """
-    fail_roll = random.random()
+    if market.closed or market.liquidity < 200:
+        return None
 
-    # 8% chance of outright failure (price moved, connection timeout, etc.)
-    if fail_roll < 0.08:
-        reasons = [
-            "Price moved too fast",
-            "Connection timeout",
-            "Order rejected by exchange",
-            "Market paused",
-        ]
-        return False, 0, 0, random.choice(reasons)
+    down = market.down_price
+    up   = market.up_price
 
-    # Simulate trade latency (50–200 ms)
-    latency_ms = random.randint(50, 200)
-    time.sleep(latency_ms / 1000)
-
-    # 15% chance of partial fill / slippage (prices worsen slightly)
-    if fail_roll < 0.23:
-        slip_yes = random.uniform(0.001, 0.008)
-        slip_no  = random.uniform(0.001, 0.008)
-        fill_yes = round(snapshot.yes_price + slip_yes, 4)
-        fill_no  = round(snapshot.no_price  + slip_no,  4)
-        return True, fill_yes, fill_no, "Slippage"
-
-    # Clean fill at quoted prices
-    return True, snapshot.yes_price, snapshot.no_price, None
+    if ENTRY_MIN_PRICE <= down <= ENTRY_MAX_PRICE:
+        return ("DOWN", down)
+    if ENTRY_MIN_PRICE <= up <= ENTRY_MAX_PRICE:
+        return ("UP", up)
+    return None
 
 
 # ─────────────────────────────────────────────
-# PROFIT CALCULATOR
+# TRADE RESOLUTION (REAL)
 # ─────────────────────────────────────────────
 
-def calculate_profit(yes_price: float, no_price: float, size: float) -> float:
+def check_resolution(trade: Trade, markets: dict[str, Market]) -> Optional[tuple[float, str, float]]:
     """
-    Arbitrage P&L formula:
-      - You buy YES at yes_price and NO at no_price.
-      - One side always wins (pays 1.00).
-      - Cost = (yes_price + no_price) * size
-      - Revenue = 1.00 * size
-      - Gross profit = (1 - (yes + no)) * size
-      - Net profit after 2% fees on each leg = gross - fee
+    Check if a trade resolved by looking at actual market price.
+    On Polymarket, winning side goes to 1.00, losing side to 0.00.
+    Returns (profit, status, exit_price) or None if still open.
     """
-    gross = (1.0 - (yes_price + no_price)) * size
-    fees  = FEE_RATE * size              # 2% total round-trip fee (spec formula)
-    return round(gross - fees, 4)
+    m = markets.get(trade.market_id)
+    if not m:
+        return None
 
+    current = m.up_price if trade.side == "UP" else m.down_price
 
-# ─────────────────────────────────────────────
-# OUTCOME RESOLVER
-# ─────────────────────────────────────────────
+    if current >= 0.97:
+        # Market resolved — our side WON
+        gross  = trade.shares * 1.0
+        fees   = FEE_RATE * trade.bet_size
+        profit = round(gross - trade.bet_size - fees, 4)
+        return (profit, "WIN", current)
 
-def resolve_trade(trade: Trade) -> Trade:
-    """
-    Resolves an OPEN trade after a short holding period.
+    if current <= 0.03:
+        # Market resolved — our side LOST
+        profit = round(-trade.bet_size, 4)
+        return (profit, "LOSS", current)
 
-    In real arb both legs pay back at resolution.
-    We model a small variance: ~80% of the time the arb pays as expected,
-    ~15% the market corrects and we lose a little, ~5% a big correction hurts.
-    """
-    roll = random.random()
-
-    if roll < 0.80:
-        # Clean arb: expected profit materialises
-        actual = trade.expected_profit
-        status = "WIN"
-    elif roll < 0.95:
-        # Partial loss: market corrected — capped at $0.50 max loss
-        actual = round(-min(random.uniform(0.01, 0.10) * trade.position_size, 0.50), 4)
-        status = "LOSS"
-    else:
-        # Big correction — capped at $1.00 max loss
-        actual = round(-min(random.uniform(0.10, 0.20) * trade.position_size, 1.00), 4)
-        status = "LOSS"
-
-    trade.actual_profit = actual
-    trade.status        = status
-    trade.close_time    = datetime.now()
-    return trade
+    return None   # Still open
 
 
 # ─────────────────────────────────────────────
 # DISPLAY HELPERS
 # ─────────────────────────────────────────────
 
-SEPARATOR = "─" * 48
+SEP = "─" * 52
 
 def print_header(scan_num: int, total: int):
-    print(f"\n{'═' * 48}")
-    print(f"  SCAN #{scan_num:03d} / {total}  |  {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
-    print(f"{'═' * 48}")
+    print(f"\n{'═' * 52}")
+    print(f"  SCAN #{scan_num:03d}/{total}  |  {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
+    print(f"{'═' * 52}")
 
+def print_market(m: Market):
+    print(f"  Market : {m.name}")
+    print(f"  UP     : {m.up_price:.4f}  |  DOWN: {m.down_price:.4f}")
+    print(f"  Liq    : ${m.liquidity:,.2f}")
 
-def print_market(snap: MarketSnapshot):
-    gap_flag = " ◄ ARB" if snap.spread_gap > (1 - ARB_THRESHOLD) else ""
-    print(f"  Market    : {snap.name}")
-    print(f"  YES       : {snap.yes_price:.4f}  |  NO: {snap.no_price:.4f}")
-    print(f"  Total     : {snap.total:.4f}   Gap: {snap.spread_gap:.4f}{gap_flag}")
-    print(f"  Liquidity : ${snap.liquidity:.2f}")
-
-
-def print_trade_open(trade: Trade):
-    print(SEPARATOR)
-    print(f"  ACTION    : BUY BOTH (YES + NO)")
-    print(f"  Trade #   : {trade.trade_id}")
-    if trade.slippage > 0:
-        print(f"  NOTE      : Slippage applied (+{trade.slippage:.4f})")
-    print(f"  Size      : ${trade.position_size:.2f}")
-    print(f"  Exp.Profit: ${trade.expected_profit:.4f}")
-    print(SEPARATOR)
-
+def print_trade_open(side: str, price: float, bet: float, shares: float, profit_if_win: float):
+    print(SEP)
+    print(f"  ACTION         : BUY {side}")
+    print(f"  Entry Price    : {price:.4f}")
+    print(f"  Shares Bought  : {shares:.2f}")
+    print(f"  Bet Size       : ${bet:.2f}")
+    print(f"  Payout if WIN  : +${profit_if_win:.4f}")
+    print(f"  Risk if LOSS   : -${bet:.2f}")
+    print(SEP)
 
 def print_skipped(reason: str):
-    print(SEPARATOR)
-    print(f"  ACTION    : SKIPPED")
-    print(f"  Reason    : {reason}")
-    print(SEPARATOR)
-
-
-def print_failed(reason: str):
-    print(SEPARATOR)
-    print(f"  ACTION    : FAILED")
-    print(f"  Reason    : {reason}")
-    print(SEPARATOR)
-
-
-def print_balance(balance: float, open_trades: int, total_profit: float):
-    sign = "+" if total_profit >= 0 else ""
-    print(f"\n  BALANCE   : ${balance:.2f}")
-    print(f"  OPEN TRADES: {open_trades}")
-    print(f"  TOTAL P&L  : {sign}${total_profit:.2f}")
-
+    print(f"  SKIPPED  : {reason}")
 
 def print_resolution(trade: Trade):
-    sign = "+" if trade.actual_profit >= 0 else ""
+    sign  = "+" if trade.actual_profit >= 0 else ""
     label = "WIN " if trade.status == "WIN" else "LOSS"
-    print(f"\n  [{label}] Trade #{trade.trade_id} resolved → {sign}${trade.actual_profit:.4f}")
+    print(f"\n  [{label}] Trade #{trade.trade_id}  {trade.side} @ {trade.entry_price:.2f}"
+          f"  →  exit {trade.exit_price:.2f}  →  {sign}${trade.actual_profit:.4f}")
 
+def print_balance(balance: float, open_count: int, total_pnl: float):
+    sign = "+" if total_pnl >= 0 else ""
+    print(f"\n  BALANCE    : ${balance:.2f}  |  Open: {open_count}  |  P&L: {sign}${total_pnl:.2f}")
 
-def print_session_summary(
-    balance: float,
-    session_start_balance: float,
-    original_balance: float,
-    all_trades: list[Trade],
-    skipped: int,
-    failed: int,
-):
-    closed = [t for t in all_trades if t.status in ("WIN", "LOSS")]
+def print_session_summary(balance, session_start, original_balance, trades, skipped):
+    closed = [t for t in trades if t.status in ("WIN", "LOSS")]
     wins   = [t for t in closed if t.status == "WIN"]
     losses = [t for t in closed if t.status == "LOSS"]
 
-    total_profit = sum(t.actual_profit for t in closed)
     win_rate     = (len(wins) / len(closed) * 100) if closed else 0
-    biggest_win  = max((t.actual_profit for t in wins),  default=0)
+    total_profit = sum(t.actual_profit for t in closed)
+    biggest_win  = max((t.actual_profit for t in wins),   default=0)
     biggest_loss = min((t.actual_profit for t in losses), default=0)
 
-    print(f"\n{'═' * 48}")
+    print(f"\n{'═' * 52}")
     print(f"  SESSION SUMMARY")
-    print(f"{'═' * 48}")
-    print(f"  Balance         : ${balance:.2f}")
-    print(f"  Session P&L     : ${balance - session_start_balance:+.2f}")
-    print(f"  All-time P&L    : ${balance - original_balance:+.2f}  (from ${original_balance:.2f})")
-    print(f"{'─' * 48}")
-    print(f"  Trades Executed : {len(closed)}")
-    print(f"  Trades Skipped  : {skipped}")
-    print(f"  Trades Failed   : {failed}")
-    print(f"  Win Rate        : {win_rate:.1f}%  ({len(wins)}W / {len(losses)}L)")
-    print(f"  Total Profit    : ${total_profit:+.4f}")
-    print(f"  Biggest Win     : ${biggest_win:+.4f}")
-    print(f"  Biggest Loss    : ${biggest_loss:+.4f}")
-    print(f"{'═' * 48}\n")
+    print(f"{'═' * 52}")
+    print(f"  Balance        : ${balance:.2f}")
+    print(f"  Session P&L    : ${balance - session_start:+.2f}")
+    print(f"  All-time P&L   : ${balance - original_balance:+.2f}  (started at ${original_balance:.2f})")
+    print(f"{'─' * 52}")
+    print(f"  Trades         : {len(closed)}  ({len(wins)}W / {len(losses)}L)")
+    print(f"  Win Rate       : {win_rate:.1f}%")
+    print(f"  Skipped        : {skipped}")
+    print(f"  Total P&L      : ${total_profit:+.4f}")
+    print(f"  Biggest Win    : ${biggest_win:+.4f}")
+    print(f"  Biggest Loss   : ${biggest_loss:+.4f}")
+    print(f"{'═' * 52}\n")
 
 
 # ─────────────────────────────────────────────
@@ -348,43 +261,28 @@ def print_session_summary(
 # ─────────────────────────────────────────────
 
 def init_csv(path: str):
-    """Creates the CSV header only if the file doesn't exist yet (preserves history)."""
     if not os.path.exists(path):
         with open(path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "trade_id", "market", "open_time", "close_time",
-                "yes_price", "no_price", "total", "position_size",
-                "expected_profit", "actual_profit", "slippage", "status", "reason",
+            csv.writer(f).writerow([
+                "trade_id", "market", "side", "entry_price", "shares",
+                "bet_size", "exit_price", "actual_profit", "status",
+                "open_time", "close_time",
             ])
 
-
 def append_csv(path: str, trade: Trade):
-    """Appends a single resolved trade row to the CSV."""
     with open(path, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            trade.trade_id,
-            trade.market,
-            trade.open_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-            trade.close_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] if trade.close_time else "",
-            trade.yes_price,
-            trade.no_price,
-            trade.total,
-            trade.position_size,
-            trade.expected_profit,
-            trade.actual_profit,
-            trade.slippage,
-            trade.status,
-            trade.reason or "",
+        csv.writer(f).writerow([
+            trade.trade_id, trade.market, trade.side,
+            trade.entry_price, trade.shares, trade.bet_size,
+            trade.exit_price, trade.actual_profit, trade.status,
+            trade.open_time.strftime("%Y-%m-%d %H:%M:%S"),
+            trade.close_time.strftime("%Y-%m-%d %H:%M:%S") if trade.close_time else "",
         ])
 
 
 # ─────────────────────────────────────────────
 # BALANCE PERSISTENCE
 # ─────────────────────────────────────────────
-
-STATE_FILE = "state.json"
 
 def load_state() -> dict:
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE)
@@ -408,36 +306,37 @@ def save_state(balance: float, original_balance: float, total_sessions: int):
 # ─────────────────────────────────────────────
 
 def run_bot(balance: float, original_balance: float) -> float:
-    session_start_balance = balance
+    session_start = balance
     open_trades: list[Trade] = []
     all_trades:  list[Trade] = []
     trade_id_seq = 0
-    skipped_count = 0
-    failed_count  = 0
-    total_profit  = 0.0
+    skipped      = 0
+    total_pnl    = 0.0
 
     if SAVE_CSV:
         csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CSV_FILENAME)
         init_csv(csv_path)
 
-    print("  Polymarket Arbitrage Bot — SIMULATION")
-    print(f"  Starting Balance : ${balance:.2f}")
-    print(f"  Target Scans     : 500 per session (runs forever)")
-    print(f"  Arb Threshold    : {ARB_THRESHOLD}")
-    print(f"  Fee Rate         : {FEE_RATE * 100:.0f}% total round-trip\n")
+    print("  Polymarket Paper Trading Bot")
+    print(f"  Balance  : ${balance:.2f}")
+    print(f"  Strategy : Buy underpriced side of Bitcoin Up/Down markets")
+    print(f"  Entry    : {ENTRY_MIN_PRICE:.2f}–{ENTRY_MAX_PRICE:.2f} price range  |  Max bet: ${MAX_BET_SIZE:.2f}\n")
 
-    scans = 500  # scans per session
-    for scan_num in range(1, scans + 1):
+    for scan_num in range(1, SCANS_PER_SESSION + 1):
+        markets = refresh_cache(scan_num)
 
-        # ── 1. Resolve any open trades whose holding period has elapsed
-        #        (In this sim we randomly age them out each scan for brevity)
+        # ── 1. Check open trades for real resolution
         still_open = []
         for t in open_trades:
-            if random.random() < 0.45:          # ~45% chance trade resolves this tick
-                t = resolve_trade(t)
-                # Return capital + net P&L (capital was deducted when trade opened)
-                balance      += t.position_size + t.actual_profit
-                total_profit += t.actual_profit
+            result = check_resolution(t, markets)
+            if result:
+                profit, status, exit_p = result
+                t.actual_profit = profit
+                t.status        = status
+                t.exit_price    = exit_p
+                t.close_time    = datetime.now()
+                balance   += t.bet_size + profit
+                total_pnl += profit
                 print_resolution(t)
                 all_trades.append(t)
                 if SAVE_CSV:
@@ -446,101 +345,105 @@ def run_bot(balance: float, original_balance: float) -> float:
                 still_open.append(t)
         open_trades = still_open
 
-        # ── 2. Pick a real market from Polymarket API
-        snap = generate_market_snapshot(scan_num)
-
-        print_header(scan_num, scans)
-        print_market(snap)
-
-        # ── 3. Skip if no arb opportunity
-        if snap.total >= ARB_THRESHOLD:
-            print_skipped("No arbitrage gap (YES+NO ≥ threshold)")
-            skipped_count += 1
+        # ── 2. Pick a market to scan
+        active_markets = [m for m in markets.values() if not m.closed]
+        if not active_markets:
+            print_header(scan_num, SCANS_PER_SESSION)
+            print("  [API] No active markets — waiting for next Bitcoin Up/Down window...")
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # ── 4. Skip if too many open positions
+        market = random.choice(active_markets)
+        print_header(scan_num, SCANS_PER_SESSION)
+        print_market(market)
+
+        # ── 3. Skip checks
         if len(open_trades) >= MAX_OPEN_TRADES:
-            print_skipped(f"Max open trades reached ({MAX_OPEN_TRADES})")
-            skipped_count += 1
+            print_skipped(f"Max open trades ({MAX_OPEN_TRADES})")
+            skipped += 1
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # ── 5. Skip if market liquidity is too low
-        if snap.liquidity < 30:
-            print_skipped(f"Low liquidity (${snap.liquidity:.2f} < $30)")
-            skipped_count += 1
+        if balance < MIN_BET_SIZE:
+            print_skipped("Insufficient balance")
+            skipped += 1
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # ── 6. Determine position size (risk-capped)
-        position_size = round(random.uniform(MIN_POSITION_SIZE, MAX_RISK_PER_TRADE), 2)
-        position_size = min(position_size, balance * 0.15)   # Never risk >15% of wallet
-        position_size = min(position_size, snap.liquidity / 2)  # Respect order-book depth
-
-        if position_size < MIN_POSITION_SIZE:
-            print_skipped("Insufficient balance or liquidity for minimum size")
-            skipped_count += 1
+        if any(t.market_id == market.market_id for t in open_trades):
+            print_skipped("Already in this market")
+            skipped += 1
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # ── 7. Attempt execution (slippage / failure simulation)
-        success, fill_yes, fill_no, exec_reason = simulate_execution(snap, position_size)
-
-        if not success:
-            print_failed(exec_reason)
-            failed_count += 1
+        signal = find_signal(market)
+        if not signal:
+            print_skipped("No signal — prices outside entry range or low liquidity")
+            skipped += 1
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # ── 8. Calculate expected profit at actual fill prices
-        slippage_amount = round((fill_yes - snap.yes_price) + (fill_no - snap.no_price), 4)
-        exp_profit = calculate_profit(fill_yes, fill_no, position_size)
+        side, price = signal
 
-        # ── 9. If after slippage the arb is no longer profitable, abort
-        if exp_profit <= 0:
-            print_skipped(f"Arb wiped out by slippage (exp profit ${exp_profit:.4f})")
-            skipped_count += 1
+        # ── 4. Size the bet (max 10% of balance per trade)
+        bet = round(min(MAX_BET_SIZE, balance * 0.10), 2)
+        if bet < MIN_BET_SIZE:
+            print_skipped("Insufficient balance for minimum bet")
+            skipped += 1
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # ── 10. Open the trade
+        shares        = round(bet / price, 4)
+        profit_if_win = round(shares * 1.0 - bet - FEE_RATE * bet, 4)
+
+        # ── 5. Open the trade
         trade_id_seq += 1
         trade = Trade(
-            trade_id      = trade_id_seq,
-            market        = snap.name,
-            yes_price     = fill_yes,
-            no_price      = fill_no,
-            total         = round(fill_yes + fill_no, 4),
-            position_size = position_size,
-            expected_profit = exp_profit,
-            slippage      = slippage_amount,
-            reason        = exec_reason,
+            trade_id    = trade_id_seq,
+            market      = market.name,
+            market_id   = market.market_id,
+            side        = side,
+            entry_price = price,
+            shares      = shares,
+            bet_size    = bet,
         )
 
-        # Deduct position cost from balance immediately
-        balance -= position_size
+        balance -= bet
         open_trades.append(trade)
 
-        print_trade_open(trade)
-        print_balance(balance, len(open_trades), total_profit)
+        print_trade_open(side, price, bet, shares, profit_if_win)
+        print_balance(balance, len(open_trades), total_pnl)
 
         time.sleep(SCAN_INTERVAL)
 
-    # ── END OF SESSION: force-close any remaining open trades
-    print(f"\n{'─' * 48}")
-    print("  Closing all remaining open positions...")
+    # ── End of session: close remaining positions at current market price (mark-to-market)
+    print(f"\n{'─' * 52}")
+    print("  Closing remaining positions at current price...")
     for t in open_trades:
-        t = resolve_trade(t)
-        balance      += t.actual_profit + t.position_size   # Return capital + P&L
-        total_profit += t.actual_profit
+        m = markets.get(t.market_id)
+        if m:
+            current = m.up_price if t.side == "UP" else m.down_price
+            gross   = t.shares * current
+            profit  = round(gross - t.bet_size - FEE_RATE * t.bet_size, 4)
+            status  = "WIN" if profit > 0 else "LOSS"
+            exit_p  = current
+        else:
+            profit = round(-t.bet_size * 0.5, 4)
+            status = "LOSS"
+            exit_p = 0.0
+
+        t.actual_profit = profit
+        t.status        = status
+        t.exit_price    = exit_p
+        t.close_time    = datetime.now()
+        balance   += t.bet_size + profit
+        total_pnl += profit
         print_resolution(t)
         all_trades.append(t)
         if SAVE_CSV:
             append_csv(csv_path, t)
 
-    # ── SESSION SUMMARY
-    print_session_summary(balance, session_start_balance, original_balance, all_trades, skipped_count, failed_count)
+    print_session_summary(balance, session_start, original_balance, all_trades, skipped)
     return balance
 
 
@@ -549,14 +452,14 @@ def run_bot(balance: float, original_balance: float) -> float:
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    state = load_state()
+    state   = load_state()
     session = state["total_sessions"] + 1
     balance = state["balance"]
 
     while True:
-        print(f"\n  {'═' * 46}")
-        print(f"  SESSION #{session} STARTING  |  Balance: ${balance:.2f}")
-        print(f"  {'═' * 46}")
+        print(f"\n  {'═' * 50}")
+        print(f"  SESSION #{session}  |  Balance: ${balance:.2f}")
+        print(f"  {'═' * 50}")
         balance = run_bot(balance, state["original_balance"])
         save_state(balance, state["original_balance"], session)
         session += 1
