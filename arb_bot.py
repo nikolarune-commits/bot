@@ -96,6 +96,9 @@ def _refresh_market_cache() -> bool:
                     prices = json.loads(prices)
                 if len(outcomes) != 2 or len(prices) != 2:
                     continue
+                question = m.get("question", "")
+                if "Bitcoin Up or Down" not in question:
+                    continue
                 yes_p = float(prices[0])
                 no_p  = float(prices[1])
                 liq   = float(m.get("liquidity") or 0)
@@ -113,7 +116,7 @@ def _refresh_market_cache() -> bool:
                 continue
         if markets:
             _market_cache = markets
-            print(f"  [API] {len(markets)} real markets loaded from Polymarket")
+            print(f"  [API] {len(markets)} Bitcoin Up/Down markets loaded from Polymarket")
             return True
         return False
     except Exception as e:
