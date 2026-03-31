@@ -92,7 +92,8 @@ def _fetch_markets(include_closed: bool = False) -> dict[str, Market]:
         for m in resp.json():
             try:
                 question = m.get("question", "")
-                if "Bitcoin Up or Down" not in question:
+                q_lower  = question.lower()
+                if "bitcoin" not in q_lower and "btc" not in q_lower:
                     continue
                 outcomes = m.get("outcomes", [])
                 prices   = m.get("outcomePrices", [])
@@ -131,7 +132,9 @@ def refresh_cache(scan_num: int) -> dict[str, Market]:
         if merged:
             _market_cache = merged
             active_count = sum(1 for m in merged.values() if not m.closed)
-            print(f"  [API] {active_count} active Bitcoin Up/Down markets loaded")
+            print(f"  [API] {active_count} active BTC markets loaded")
+            for mm in list(merged.values())[:3]:
+                print(f"  [API]   → {mm.name[:55]}  UP:{mm.up_price:.2f} DN:{mm.down_price:.2f}")
         _cache_last_scan = scan_num
     return _market_cache
 
