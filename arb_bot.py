@@ -1,10 +1,8 @@
 """
-Polymarket-style Arbitrage Bot Simulation
-==========================================
-Simulates a short-term binary prediction market arbitrage strategy.
-Markets focus on Bitcoin price direction (5-15 minute windows).
-
-This is a SIMULATION ONLY. No real money is used.
+Polymarket Paper Trading Bot
+=============================
+Uses REAL market data from Polymarket's public API.
+Trades are simulated (fake balance) — no real money moves.
 """
 
 import random
@@ -12,6 +10,7 @@ import time
 import csv
 import os
 import json
+import requests
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
@@ -30,15 +29,8 @@ SCAN_INTERVAL       = 0.12        # Seconds between scans (simulated latency)
 SAVE_CSV            = True        # Save trade log to CSV
 CSV_FILENAME        = "trade_log.csv"
 
-# Bitcoin market window labels — rotated to simulate multiple markets
-BTC_MARKETS = [
-    "BTC > $68k (5m)",
-    "BTC > $69k (10m)",
-    "BTC > $70k (15m)",
-    "BTC < $67.5k (5m)",
-    "BTC > $70.5k (10m)",
-    "BTC above $69.5k (15m)",
-]
+POLYMARKET_API = "https://gamma-api.polymarket.com"
+CACHE_REFRESH_INTERVAL = 50   # re-fetch real markets every N scans
 
 # ─────────────────────────────────────────────
 # DATA STRUCTURES
@@ -75,53 +67,94 @@ class Trade:
 
 
 # ─────────────────────────────────────────────
-# MARKET DATA GENERATOR
+# REAL MARKET DATA (POLYMARKET API)
 # ─────────────────────────────────────────────
 
-def generate_market_snapshot(name: str) -> MarketSnapshot:
-    """
-    Simulates a realistic prediction market tick.
+_market_cache: list[dict] = []
+_cache_last_scan: int = -9999
 
-    Most of the time YES + NO ≈ 1.00 (efficient market).
-    ~20% of the time there is a small gap (arbitrage window).
-    ~5% of the time there is a LARGE gap (fat opportunity).
-    """
-    # Base YES probability, slightly randomised per tick
-    base_yes = random.uniform(0.35, 0.65)
 
-    roll = random.random()
+def _refresh_market_cache() -> bool:
+    """Fetch live binary markets from Polymarket's public API."""
+    global _market_cache
+    try:
+        resp = requests.get(
+            f"{POLYMARKET_API}/markets",
+            params={"active": "true", "closed": "false", "limit": 100},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        markets = []
+        for m in raw:
+            try:
+                outcomes = m.get("outcomes", [])
+                prices   = m.get("outcomePrices", [])
+                if isinstance(outcomes, str):
+                    outcomes = json.loads(outcomes)
+                if isinstance(prices, str):
+                    prices = json.loads(prices)
+                if len(outcomes) != 2 or len(prices) != 2:
+                    continue
+                yes_p = float(prices[0])
+                no_p  = float(prices[1])
+                liq   = float(m.get("liquidity") or 0)
+                if not (0.01 <= yes_p <= 0.99 and 0.01 <= no_p <= 0.99):
+                    continue
+                if liq < 10:
+                    continue
+                markets.append({
+                    "name":      m.get("question", "Unknown")[:60],
+                    "yes_price": yes_p,
+                    "no_price":  no_p,
+                    "liquidity": liq,
+                })
+            except (ValueError, TypeError, KeyError):
+                continue
+        if markets:
+            _market_cache = markets
+            print(f"  [API] {len(markets)} real markets loaded from Polymarket")
+            return True
+        return False
+    except Exception as e:
+        print(f"  [API] Fetch failed: {e} — using last cache")
+        return False
 
-    if roll < 0.05:
-        # Large arb gap: 3-6% spread
-        gap = random.uniform(0.03, 0.06)
-        yes = round(base_yes - gap / 2, 4)
-        no  = round((1 - base_yes) - gap / 2, 4)
-    elif roll < 0.20:
-        # Small arb gap: 1-3% spread
-        gap = random.uniform(0.01, 0.03)
-        yes = round(base_yes - gap / 2, 4)
-        no  = round((1 - base_yes) - gap / 2, 4)
-    else:
-        # Efficient market: slight noise around 1.00
-        noise = random.uniform(-0.005, 0.005)
-        yes = round(base_yes + noise, 4)
-        no  = round(1.0 - yes + random.uniform(-0.004, 0.004), 4)
 
-    # Clamp prices to valid range
+def generate_market_snapshot(scan_num: int) -> MarketSnapshot:
+    """Pick a real market from the cache; refresh cache every N scans."""
+    global _cache_last_scan
+
+    if scan_num - _cache_last_scan >= CACHE_REFRESH_INTERVAL or not _market_cache:
+        _refresh_market_cache()
+        _cache_last_scan = scan_num
+
+    if _market_cache:
+        m     = random.choice(_market_cache)
+        yes   = round(m["yes_price"], 4)
+        no    = round(m["no_price"],  4)
+        total = round(yes + no, 4)
+        return MarketSnapshot(
+            name=m["name"],
+            yes_price=yes,
+            no_price=no,
+            total=total,
+            liquidity=round(m["liquidity"], 2),
+            spread_gap=round(1.0 - total, 4),
+        )
+
+    # Fallback: simulate if API is completely unavailable
+    yes = round(random.uniform(0.35, 0.65), 4)
+    no  = round(1.0 - yes + random.uniform(-0.004, 0.004), 4)
     yes = max(0.01, min(0.99, yes))
     no  = max(0.01, min(0.99, no))
-    total = round(yes + no, 4)
-
-    # Simulate order-book liquidity (USD available to trade against)
-    liquidity = round(random.uniform(20, 500), 2)
-
     return MarketSnapshot(
-        name=name,
+        name="[OFFLINE] Simulated Market",
         yes_price=yes,
         no_price=no,
-        total=total,
-        liquidity=liquidity,
-        spread_gap=round(1.0 - total, 4),
+        total=round(yes + no, 4),
+        liquidity=round(random.uniform(20, 500), 2),
+        spread_gap=round(1.0 - yes - no, 4),
     )
 
 
@@ -410,9 +443,8 @@ def run_bot(balance: float, original_balance: float) -> float:
                 still_open.append(t)
         open_trades = still_open
 
-        # ── 2. Pick a market to scan
-        market_name = random.choice(BTC_MARKETS)
-        snap        = generate_market_snapshot(market_name)
+        # ── 2. Pick a real market from Polymarket API
+        snap = generate_market_snapshot(scan_num)
 
         print_header(scan_num, scans)
         print_market(snap)
