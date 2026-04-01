@@ -287,20 +287,51 @@ def append_csv(path: str, trade: Trade):
 # BALANCE PERSISTENCE
 # ─────────────────────────────────────────────
 
+def trades_to_json(trades: list[Trade]) -> list[dict]:
+    return [{
+        "trade_id":    t.trade_id,
+        "market":      t.market,
+        "market_id":   t.market_id,
+        "side":        t.side,
+        "entry_price": t.entry_price,
+        "shares":      t.shares,
+        "bet_size":    t.bet_size,
+        "open_time":   t.open_time.isoformat(),
+    } for t in trades]
+
+def trades_from_json(data: list) -> list[Trade]:
+    result = []
+    for d in (data or []):
+        try:
+            result.append(Trade(
+                trade_id    = d["trade_id"],
+                market      = d["market"],
+                market_id   = d["market_id"],
+                side        = d["side"],
+                entry_price = d["entry_price"],
+                shares      = d["shares"],
+                bet_size    = d["bet_size"],
+                open_time   = datetime.fromisoformat(d["open_time"]),
+            ))
+        except (KeyError, ValueError):
+            continue
+    return result
+
 def load_state() -> dict:
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE)
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
-    return {"balance": STARTING_BALANCE, "original_balance": STARTING_BALANCE, "total_sessions": 0}
+    return {"balance": STARTING_BALANCE, "original_balance": STARTING_BALANCE, "total_sessions": 0, "open_trades": []}
 
-def save_state(balance: float, original_balance: float, total_sessions: int):
+def save_state(balance: float, original_balance: float, total_sessions: int, open_trades: list[Trade]):
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE)
     with open(path, "w") as f:
         json.dump({
-            "balance": balance,
+            "balance":        balance,
             "original_balance": original_balance,
             "total_sessions": total_sessions,
+            "open_trades":    trades_to_json(open_trades),
         }, f)
 
 
@@ -308,13 +339,13 @@ def save_state(balance: float, original_balance: float, total_sessions: int):
 # MAIN BOT LOOP
 # ─────────────────────────────────────────────
 
-def run_bot(balance: float, original_balance: float) -> float:
+def run_bot(balance: float, original_balance: float, carried_trades: list[Trade]) -> tuple[float, list[Trade]]:
     session_start = balance
-    open_trades: list[Trade] = []
+    open_trades   = carried_trades   # carry over unresolved trades from last session
     all_trades:  list[Trade] = []
-    trade_id_seq = 0
-    skipped      = 0
-    total_pnl    = 0.0
+    trade_id_seq  = max((t.trade_id for t in open_trades), default=0)
+    skipped       = 0
+    total_pnl     = 0.0
 
     if SAVE_CSV:
         csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CSV_FILENAME)
@@ -419,35 +450,15 @@ def run_bot(balance: float, original_balance: float) -> float:
 
         time.sleep(SCAN_INTERVAL)
 
-    # ── End of session: close remaining positions at current market price (mark-to-market)
-    print(f"\n{'─' * 52}")
-    print("  Closing remaining positions at current price...")
-    for t in open_trades:
-        m = markets.get(t.market_id)
-        if m:
-            current = m.up_price if t.side == "UP" else m.down_price
-            gross   = t.shares * current
-            profit  = round(gross - t.bet_size - FEE_RATE * t.bet_size, 4)
-            status  = "WIN" if profit > 0 else "LOSS"
-            exit_p  = current
-        else:
-            profit = round(-t.bet_size * 0.5, 4)
-            status = "LOSS"
-            exit_p = 0.0
-
-        t.actual_profit = profit
-        t.status        = status
-        t.exit_price    = exit_p
-        t.close_time    = datetime.now()
-        balance   += t.bet_size + profit
-        total_pnl += profit
-        print_resolution(t)
-        all_trades.append(t)
-        if SAVE_CSV:
-            append_csv(csv_path, t)
+    # ── End of session: carry open trades to next session (do NOT force-close)
+    if open_trades:
+        print(f"\n{'─' * 52}")
+        print(f"  {len(open_trades)} trade(s) still open — carrying to next session")
+        for t in open_trades:
+            print(f"    #{t.trade_id} {t.side} @ {t.entry_price:.4f}  bet=${t.bet_size:.2f}")
 
     print_session_summary(balance, session_start, original_balance, all_trades, skipped)
-    return balance
+    return balance, open_trades
 
 
 # ─────────────────────────────────────────────
@@ -455,16 +466,17 @@ def run_bot(balance: float, original_balance: float) -> float:
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    state   = load_state()
-    session = state["total_sessions"] + 1
-    balance = state["balance"]
+    state        = load_state()
+    session      = state["total_sessions"] + 1
+    balance      = state["balance"]
+    open_trades  = trades_from_json(state.get("open_trades", []))
 
     while True:
         print(f"\n  {'═' * 50}")
-        print(f"  SESSION #{session}  |  Balance: ${balance:.2f}")
+        print(f"  SESSION #{session}  |  Balance: ${balance:.2f}  |  Open trades: {len(open_trades)}")
         print(f"  {'═' * 50}")
-        balance = run_bot(balance, state["original_balance"])
-        save_state(balance, state["original_balance"], session)
+        balance, open_trades = run_bot(balance, state["original_balance"], open_trades)
+        save_state(balance, state["original_balance"], session, open_trades)
         session += 1
         print("  Restarting in 5 seconds...\n")
         time.sleep(5)
