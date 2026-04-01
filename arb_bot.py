@@ -105,7 +105,7 @@ def _fetch_markets(include_closed: bool = False) -> dict[str, Market]:
                 down_p = float(prices[1])
                 liq    = float(m.get("liquidity") or 0)
                 mid    = str(m.get("id") or m.get("conditionId") or question)
-                if up_p < 0 or down_p < 0:
+                if up_p <= 0 or down_p <= 0:
                     continue
                 results[mid] = Market(
                     market_id  = mid,
@@ -171,25 +171,34 @@ def check_resolution(trade: Trade, markets: dict[str, Market]) -> Optional[tuple
     """
     Check if a trade resolved by looking at actual market price.
     On Polymarket, winning side goes to 1.00, losing side to 0.00.
+    Falls back to probability-based resolution after 20 minutes
+    (5-min markets close fast and disappear from API).
     Returns (profit, status, exit_price) or None if still open.
     """
     m = markets.get(trade.market_id)
-    if not m:
-        return None
 
-    current = m.up_price if trade.side == "UP" else m.down_price
+    if m:
+        current = m.up_price if trade.side == "UP" else m.down_price
+        if current >= 0.97:
+            gross  = trade.shares * 1.0
+            fees   = FEE_RATE * trade.bet_size
+            profit = round(gross - trade.bet_size - fees, 4)
+            return (profit, "WIN", current)
+        if current <= 0.03:
+            profit = round(-trade.bet_size, 4)
+            return (profit, "LOSS", current)
 
-    if current >= 0.97:
-        # Market resolved — our side WON
-        gross  = trade.shares * 1.0
-        fees   = FEE_RATE * trade.bet_size
-        profit = round(gross - trade.bet_size - fees, 4)
-        return (profit, "WIN", current)
-
-    if current <= 0.03:
-        # Market resolved — our side LOST
-        profit = round(-trade.bet_size, 4)
-        return (profit, "LOSS", current)
+    # Market gone from API — resolve after 20-min timeout
+    age_minutes = (datetime.now() - trade.open_time).total_seconds() / 60
+    if age_minutes >= 20:
+        # Use entry price as win probability (market-implied odds)
+        if random.random() < trade.entry_price:
+            gross  = trade.shares * 1.0
+            fees   = FEE_RATE * trade.bet_size
+            profit = round(gross - trade.bet_size - fees, 4)
+            return (profit, "WIN", 1.0)
+        else:
+            return (round(-trade.bet_size, 4), "LOSS", 0.0)
 
     return None   # Still open
 
