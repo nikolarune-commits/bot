@@ -174,6 +174,8 @@ def btc_signal() -> Optional[tuple[str, float]]:
         if candles:
             _btc_cache      = {"candles": candles, "bids": bids, "asks": asks}
             _btc_cache_time = now
+        else:
+            print("  [BTC] Binance data unavailable — skipping signal")
 
     candles = _btc_cache.get("candles", [])
     bids    = _btc_cache.get("bids", [])
