@@ -297,7 +297,10 @@ def _fetch_markets(include_closed: bool = False) -> dict[str, Market]:
             try:
                 question = m.get("question", "")
                 q_lower  = question.lower()
-                if "bitcoin" not in q_lower and "btc" not in q_lower:
+                # Only trade Bitcoin Up/Down 5-minute markets
+                is_btc = "bitcoin" in q_lower or "btc" in q_lower
+                is_updown = "up or down" in q_lower or "5 min" in q_lower or "5-min" in q_lower or "updown" in q_lower
+                if not is_btc or not is_updown:
                     continue
                 outcomes = m.get("outcomes", [])
                 prices   = m.get("outcomePrices", [])
