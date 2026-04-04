@@ -20,18 +20,21 @@ from typing import Optional
 # CONFIGURATION
 # ─────────────────────────────────────────────
 STARTING_BALANCE   = 100.00   # Starting balance (first run only)
-MAX_BET_SIZE       = 8.00     # Max $ per trade
-MIN_BET_SIZE       = 3.00     # Min $ per trade
-MAX_OPEN_TRADES    = 3        # Max concurrent positions
+BET_PCT            = 0.05     # Bet 5% of current balance per trade
+MAX_BET_SIZE       = 6.00     # Cap per trade
+MIN_BET_SIZE       = 1.00     # Minimum to place a trade
+MAX_OPEN_TRADES    = 2        # Max concurrent positions
 FEE_RATE           = 0.02     # 2% fee (matches real Polymarket)
-ENTRY_MIN_PRICE    = 0.20     # Don't buy below this (too risky)
-ENTRY_MAX_PRICE    = 0.49     # Only buy the cheaper/underpriced side
+ENTRY_MIN_PRICE    = 0.35     # Min Polymarket price for our direction (avoid coin-flips)
+ENTRY_MAX_PRICE    = 0.72     # Max price (avoid near-certainties with low payout)
 SCAN_INTERVAL      = 2.0      # Seconds between scans
 SCANS_PER_SESSION  = 300      # ~10 min per session
 API_REFRESH_SCANS  = 30       # Re-fetch markets every N scans (~60s)
+BTC_CACHE_SECONDS  = 10       # Refresh Binance data every 10 seconds
 SAVE_CSV           = True
 CSV_FILENAME       = "trade_log.csv"
 POLYMARKET_API     = "https://gamma-api.polymarket.com"
+BINANCE_API        = "https://api.binance.com/api/v3"
 STATE_FILE         = "state.json"
 
 
@@ -65,6 +68,158 @@ class Trade:
     open_time: datetime = field(default_factory=datetime.now)
     close_time: Optional[datetime] = None
     exit_price: float = 0.0
+
+
+# ─────────────────────────────────────────────
+# BINANCE DATA (real BTC price + order book)
+# ─────────────────────────────────────────────
+
+def get_btc_candles(limit: int = 30) -> list:
+    """Fetch recent 1-minute OHLCV candles from Binance (no auth needed)."""
+    try:
+        r = requests.get(f"{BINANCE_API}/klines",
+                         params={"symbol": "BTCUSDT", "interval": "1m", "limit": limit},
+                         timeout=5)
+        return r.json() if r.ok else []
+    except Exception:
+        return []
+
+def get_order_book(limit: int = 20) -> tuple:
+    """Fetch top bid/ask levels from Binance order book (no auth needed)."""
+    try:
+        r = requests.get(f"{BINANCE_API}/depth",
+                         params={"symbol": "BTCUSDT", "limit": limit},
+                         timeout=5)
+        if r.ok:
+            d = r.json()
+            return d["bids"], d["asks"]
+    except Exception:
+        pass
+    return [], []
+
+
+# ─────────────────────────────────────────────
+# TECHNICAL ANALYSIS
+# ─────────────────────────────────────────────
+
+def calc_ema(values: list, period: int) -> float:
+    """Exponential Moving Average."""
+    if len(values) < period:
+        return values[-1] if values else 0.0
+    k = 2 / (period + 1)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+def calc_rsi(closes: list, period: int = 14) -> float:
+    """RSI (0–100). Returns 50 if not enough data."""
+    if len(closes) < period + 1:
+        return 50.0
+    deltas  = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains   = [max(d, 0)    for d in deltas[-period:]]
+    losses  = [abs(min(d, 0)) for d in deltas[-period:]]
+    avg_g   = sum(gains)  / period
+    avg_l   = sum(losses) / period
+    if avg_l == 0:
+        return 100.0
+    return 100 - (100 / (1 + avg_g / avg_l))
+
+def calc_obi(bids: list, asks: list, levels: int = 10) -> float:
+    """Order Book Imbalance: +1 = all buy pressure, -1 = all sell pressure."""
+    bid_vol = sum(float(b[1]) for b in bids[:levels])
+    ask_vol = sum(float(a[1]) for a in asks[:levels])
+    total   = bid_vol + ask_vol
+    return (bid_vol - ask_vol) / total if total > 0 else 0.0
+
+def calc_window_delta(candles: list) -> float:
+    """% BTC price moved since the current 5-minute Polymarket window opened."""
+    if not candles:
+        return 0.0
+    window_ts    = int(time.time()) - (int(time.time()) % 300)  # floor to 5-min boundary
+    window_ts_ms = window_ts * 1000
+    window_candle = next((c for c in candles if c[0] >= window_ts_ms), candles[-1])
+    window_open  = float(window_candle[1])   # candle open price
+    current      = float(candles[-1][4])     # most recent candle close
+    if window_open == 0:
+        return 0.0
+    return (current - window_open) / window_open * 100
+
+
+# ─────────────────────────────────────────────
+# BTC SIGNAL (4-indicator momentum system)
+# ─────────────────────────────────────────────
+
+_btc_cache: dict      = {}
+_btc_cache_time: float = 0.0
+
+def btc_signal() -> Optional[tuple[str, float]]:
+    """
+    Combines 4 independent BTC indicators into a directional signal.
+    Returns (direction, confidence) or None if signals conflict/are weak.
+
+    Signals & weights:
+      Window Delta  (5–7)  — how much BTC moved since window opened
+      EMA 9/21      (1)    — short-term trend direction
+      RSI 14        (1–2)  — overbought/oversold extremes
+      OBI           (1–2)  — order book buy vs sell pressure
+
+    Trade only when confidence >= 30% (signals agree enough).
+    """
+    global _btc_cache, _btc_cache_time
+    now = time.time()
+    if now - _btc_cache_time > BTC_CACHE_SECONDS:
+        candles      = get_btc_candles(30)
+        bids, asks   = get_order_book(20)
+        if candles:
+            _btc_cache      = {"candles": candles, "bids": bids, "asks": asks}
+            _btc_cache_time = now
+
+    candles = _btc_cache.get("candles", [])
+    bids    = _btc_cache.get("bids", [])
+    asks    = _btc_cache.get("asks", [])
+    if not candles:
+        return None
+
+    closes = [float(c[4]) for c in candles]
+    score  = 0.0
+
+    # Signal 1: Window Delta — most important (weight 5–7)
+    delta = calc_window_delta(candles)
+    if   delta >  0.10: score += 7
+    elif delta >  0.02: score += 5
+    elif delta < -0.10: score -= 7
+    elif delta < -0.02: score -= 5
+
+    # Signal 2: EMA 9/21 crossover (weight 1)
+    ema9  = calc_ema(closes, 9)
+    ema21 = calc_ema(closes, 21)
+    score += 1 if ema9 > ema21 else -1
+
+    # Signal 3: RSI 14 (weight 1–2)
+    rsi = calc_rsi(closes)
+    if   rsi < 25: score += 2   # oversold → bounce UP
+    elif rsi > 75: score -= 2   # overbought → drop DOWN
+    elif rsi > 55: score += 1
+    elif rsi < 45: score -= 1
+
+    # Signal 4: Order Book Imbalance (weight 1–2)
+    obi = calc_obi(bids, asks)
+    if   obi >  0.3: score += 2
+    elif obi >  0.1: score += 1
+    elif obi < -0.3: score -= 2
+    elif obi < -0.1: score -= 1
+
+    confidence = min(abs(score) / 7.0, 1.0)
+    direction  = "UP" if score > 0 else "DOWN"
+
+    print(f"  [BTC] Δ={delta:+.3f}%  RSI={rsi:.0f}  EMA={'↑' if ema9>ema21 else '↓'}  "
+          f"OBI={obi:+.2f}  score={score:+.0f}  conf={confidence:.0%}  → {direction}")
+
+    if confidence < 0.30:
+        return None   # signals too weak or conflicting
+
+    return (direction, confidence)
 
 
 # ─────────────────────────────────────────────
@@ -145,22 +300,24 @@ def refresh_cache(scan_num: int) -> dict[str, Market]:
 
 def find_signal(market: Market) -> Optional[tuple[str, float]]:
     """
-    Returns (side, price) to buy, or None if no signal.
-    Strategy: buy the cheaper side when it's in the value zone.
-    Lower price = bigger payout if correct, but harder to win.
-    Only trade liquid markets.
+    Uses real BTC momentum from Binance to determine direction.
+    Only trades when 4 independent signals agree (confidence >= 30%).
+    Then confirms Polymarket's price for that direction is in a tradeable range.
     """
     if market.closed:
         return None
 
-    down = market.down_price
-    up   = market.up_price
+    sig = btc_signal()
+    if not sig:
+        return None
 
-    if ENTRY_MIN_PRICE <= down <= ENTRY_MAX_PRICE:
-        return ("DOWN", down)
-    if ENTRY_MIN_PRICE <= up <= ENTRY_MAX_PRICE:
-        return ("UP", up)
-    return None
+    direction, _confidence = sig
+    price = market.up_price if direction == "UP" else market.down_price
+
+    if not (ENTRY_MIN_PRICE <= price <= ENTRY_MAX_PRICE):
+        return None   # market already priced in the move, no edge left
+
+    return (direction, price)
 
 
 # ─────────────────────────────────────────────
@@ -428,8 +585,8 @@ def run_bot(balance: float, original_balance: float, carried_trades: list[Trade]
 
         side, price = signal
 
-        # ── 4. Size the bet (max 10% of balance per trade)
-        bet = round(min(MAX_BET_SIZE, balance * 0.10), 2)
+        # ── 4. Size the bet (5% of balance, capped at MAX_BET_SIZE)
+        bet = round(min(MAX_BET_SIZE, max(MIN_BET_SIZE, balance * BET_PCT)), 2)
         if bet < MIN_BET_SIZE:
             print_skipped("Insufficient balance for minimum bet")
             skipped += 1
@@ -479,6 +636,13 @@ if __name__ == "__main__":
     session      = state["total_sessions"] + 1
     balance      = state["balance"]
     open_trades  = trades_from_json(state.get("open_trades", []))
+
+    # Auto-reset if balance too low to trade
+    if balance < MIN_BET_SIZE:
+        print(f"\n  Balance ${balance:.2f} too low — resetting to ${STARTING_BALANCE:.2f}\n")
+        balance = STARTING_BALANCE
+        open_trades = []
+        state["original_balance"] = STARTING_BALANCE
 
     while True:
         print(f"\n  {'═' * 50}")
