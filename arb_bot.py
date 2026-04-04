@@ -279,11 +279,79 @@ _market_cache: dict[str, Market] = {}
 _cache_last_scan: int = -9999
 
 
-def _fetch_markets(include_closed: bool = False) -> dict[str, Market]:
-    """Fetch Bitcoin Up/Down 5-minute markets from Polymarket API."""
+def _parse_market(m: dict, closed_override: bool = False) -> Optional[Market]:
+    """Parse a single market dict into a Market object. Returns None if invalid."""
+    try:
+        question = m.get("question", "")
+        outcomes = m.get("outcomes", [])
+        prices   = m.get("outcomePrices", [])
+        if isinstance(outcomes, str): outcomes = json.loads(outcomes)
+        if isinstance(prices,   str): prices   = json.loads(prices)
+        if len(prices) != 2:
+            return None
+        up_p   = float(prices[0])
+        down_p = float(prices[1])
+        if up_p <= 0 or down_p <= 0:
+            return None
+        mid = str(m.get("id") or m.get("conditionId") or question)
+        return Market(
+            market_id  = mid,
+            name       = question[:60],
+            up_price   = up_p,
+            down_price = down_p,
+            liquidity  = float(m.get("liquidity") or 0),
+            closed     = closed_override or bool(m.get("closed", False)),
+        )
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def _fetch_by_slug() -> dict[str, Market]:
+    """
+    Fetch the current Bitcoin Up/Down window market using its deterministic slug.
+    Slug format: btc-updown-5m-{window_timestamp}
+    This is more reliable than searching because the slug is always known.
+    """
     results = {}
-    queries = ["Bitcoin Up or Down", "BTC Up or Down"]
-    for query in queries:
+    # Check current window and the previous two (in case we're near a boundary)
+    now = int(time.time())
+    window_timestamps = [now - (now % 300) - (i * 300) for i in range(3)]
+    for wts in window_timestamps:
+        slug = f"btc-updown-5m-{wts}"
+        try:
+            resp = requests.get(f"{POLYMARKET_API}/events",
+                                params={"slug": slug}, timeout=8)
+            if not resp.ok:
+                continue
+            data = resp.json()
+            events = data if isinstance(data, list) else [data]
+            for event in events:
+                if not event:
+                    continue
+                # Markets are nested inside the event
+                for m in event.get("markets", []):
+                    market = _parse_market(m)
+                    if market:
+                        results[market.market_id] = market
+                        print(f"  [API] Found via slug: {market.name[:50]}  UP:{market.up_price:.2f} DN:{market.down_price:.2f}")
+        except Exception:
+            continue
+    return results
+
+
+def _fetch_markets(include_closed: bool = False) -> dict[str, Market]:
+    """
+    Fetch Bitcoin Up/Down 5-minute markets.
+    Primary: direct slug lookup (most reliable).
+    Fallback: text search of the /markets endpoint.
+    """
+    # 1. Try slug-based direct lookup first
+    results = _fetch_by_slug()
+    if results:
+        return results
+
+    # 2. Fallback: text search
+    for query in ["Bitcoin Up or Down", "BTC Up or Down"]:
         try:
             params = {"limit": 50, "q": query}
             if not include_closed:
@@ -291,44 +359,21 @@ def _fetch_markets(include_closed: bool = False) -> dict[str, Market]:
                 params["closed"] = "false"
             else:
                 params["closed"] = "true"
-
             resp = requests.get(f"{POLYMARKET_API}/markets", params=params, timeout=10)
             if not resp.ok:
                 continue
-
             for m in resp.json():
-                try:
-                    question = m.get("question", "")
-                    q_lower  = question.lower()
-                    is_btc    = "bitcoin" in q_lower or "btc" in q_lower
-                    is_updown = ("up or down" in q_lower or "5 min" in q_lower
-                                 or "5-min" in q_lower or "updown" in q_lower)
-                    if not is_btc or not is_updown:
-                        continue
-                    outcomes = m.get("outcomes", [])
-                    prices   = m.get("outcomePrices", [])
-                    if isinstance(outcomes, str): outcomes = json.loads(outcomes)
-                    if isinstance(prices,   str): prices   = json.loads(prices)
-                    if len(prices) != 2:
-                        continue
-                    up_p   = float(prices[0])
-                    down_p = float(prices[1])
-                    liq    = float(m.get("liquidity") or 0)
-                    mid    = str(m.get("id") or m.get("conditionId") or question)
-                    if up_p <= 0 or down_p <= 0:
-                        continue
-                    results[mid] = Market(
-                        market_id  = mid,
-                        name       = question[:60],
-                        up_price   = up_p,
-                        down_price = down_p,
-                        liquidity  = liq,
-                        closed     = bool(m.get("closed", False)),
-                    )
-                except (ValueError, TypeError, KeyError):
+                q_lower = m.get("question", "").lower()
+                if ("bitcoin" not in q_lower and "btc" not in q_lower):
                     continue
+                if not ("up or down" in q_lower or "5 min" in q_lower
+                        or "5-min" in q_lower or "updown" in q_lower):
+                    continue
+                market = _parse_market(m)
+                if market:
+                    results[market.market_id] = market
         except Exception as e:
-            print(f"  [API] Fetch failed ({query}): {e}")
+            print(f"  [API] Search failed ({query}): {e}")
     return results
 
 
@@ -366,7 +411,7 @@ def find_signal(market: Market) -> Optional[tuple[str, float]]:
     if not sig:
         return None
 
-    direction, _confidence = sig
+    direction, _ = sig
     price = market.up_price if direction == "UP" else market.down_price
 
     if not (ENTRY_MIN_PRICE <= price <= ENTRY_MAX_PRICE):
