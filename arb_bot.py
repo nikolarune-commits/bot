@@ -71,21 +71,55 @@ class Trade:
 
 
 # ─────────────────────────────────────────────
-# BINANCE DATA (real BTC price + order book)
+# BTC PRICE DATA  (Binance → Kraken fallback)
 # ─────────────────────────────────────────────
 
 def get_btc_candles(limit: int = 30) -> list:
-    """Fetch recent 1-minute OHLCV candles from Binance (no auth needed)."""
+    """
+    Fetch recent 1-minute OHLCV candles.
+    Tries Binance first; falls back to Kraken if Binance is unavailable.
+    Returns list of [ts, open, high, low, close, ...] rows.
+    """
+    # --- Binance ---
     try:
         r = requests.get(f"{BINANCE_API}/klines",
                          params={"symbol": "BTCUSDT", "interval": "1m", "limit": limit},
                          timeout=5)
-        return r.json() if r.ok else []
+        if r.ok and isinstance(r.json(), list) and r.json():
+            return r.json()
     except Exception:
-        return []
+        pass
+
+    # --- Kraken fallback ---
+    try:
+        r = requests.get("https://api.kraken.com/0/public/OHLC",
+                         params={"pair": "XBTUSD", "interval": 1},
+                         timeout=5)
+        if r.ok:
+            result = r.json().get("result", {})
+            rows   = result.get("XXBTZUSD", result.get("XBTUSD", []))
+            if rows:
+                # Kraken format: [time, open, high, low, close, vwap, volume, count]
+                # Normalise to Binance-style: [ts_ms, open, high, low, close, ...]
+                out = []
+                for row in rows[-limit:]:
+                    ts_ms = int(row[0]) * 1000
+                    out.append([ts_ms, row[1], row[2], row[3], row[4]])
+                print("  [BTC] Using Kraken data (Binance unavailable)")
+                return out
+    except Exception:
+        pass
+
+    print("  [BTC] All price sources failed")
+    return []
+
 
 def get_order_book(limit: int = 20) -> tuple:
-    """Fetch top bid/ask levels from Binance order book (no auth needed)."""
+    """
+    Fetch top bid/ask levels.
+    Tries Binance first; falls back to Kraken.
+    """
+    # --- Binance ---
     try:
         r = requests.get(f"{BINANCE_API}/depth",
                          params={"symbol": "BTCUSDT", "limit": limit},
@@ -95,6 +129,21 @@ def get_order_book(limit: int = 20) -> tuple:
             return d["bids"], d["asks"]
     except Exception:
         pass
+
+    # --- Kraken fallback ---
+    try:
+        r = requests.get("https://api.kraken.com/0/public/Depth",
+                         params={"pair": "XBTUSD", "count": limit},
+                         timeout=5)
+        if r.ok:
+            result = r.json().get("result", {})
+            book   = result.get("XXBTZUSD", result.get("XBTUSD", {}))
+            bids   = [[b[0], b[1]] for b in book.get("bids", [])]
+            asks   = [[a[0], a[1]] for a in book.get("asks", [])]
+            return bids, asks
+    except Exception:
+        pass
+
     return [], []
 
 
@@ -174,8 +223,6 @@ def btc_signal() -> Optional[tuple[str, float]]:
         if candles:
             _btc_cache      = {"candles": candles, "bids": bids, "asks": asks}
             _btc_cache_time = now
-        else:
-            print("  [BTC] Binance data unavailable — skipping signal")
 
     candles = _btc_cache.get("candles", [])
     bids    = _btc_cache.get("bids", [])
