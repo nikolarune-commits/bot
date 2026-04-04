@@ -280,52 +280,55 @@ _cache_last_scan: int = -9999
 
 
 def _fetch_markets(include_closed: bool = False) -> dict[str, Market]:
-    """Fetch Bitcoin Up/Down markets from Polymarket API."""
+    """Fetch Bitcoin Up/Down 5-minute markets from Polymarket API."""
     results = {}
-    try:
-        params = {"limit": 100}
-        if not include_closed:
-            params["active"] = "true"
-            params["closed"] = "false"
-        else:
-            params["closed"] = "true"
+    queries = ["Bitcoin Up or Down", "BTC Up or Down"]
+    for query in queries:
+        try:
+            params = {"limit": 50, "q": query}
+            if not include_closed:
+                params["active"] = "true"
+                params["closed"] = "false"
+            else:
+                params["closed"] = "true"
 
-        resp = requests.get(f"{POLYMARKET_API}/markets", params=params, timeout=10)
-        resp.raise_for_status()
-
-        for m in resp.json():
-            try:
-                question = m.get("question", "")
-                q_lower  = question.lower()
-                # Only trade Bitcoin Up/Down 5-minute markets
-                is_btc = "bitcoin" in q_lower or "btc" in q_lower
-                is_updown = "up or down" in q_lower or "5 min" in q_lower or "5-min" in q_lower or "updown" in q_lower
-                if not is_btc or not is_updown:
-                    continue
-                outcomes = m.get("outcomes", [])
-                prices   = m.get("outcomePrices", [])
-                if isinstance(outcomes, str): outcomes = json.loads(outcomes)
-                if isinstance(prices,   str): prices   = json.loads(prices)
-                if len(prices) != 2:
-                    continue
-                up_p   = float(prices[0])
-                down_p = float(prices[1])
-                liq    = float(m.get("liquidity") or 0)
-                mid    = str(m.get("id") or m.get("conditionId") or question)
-                if up_p <= 0 or down_p <= 0:
-                    continue
-                results[mid] = Market(
-                    market_id  = mid,
-                    name       = question[:60],
-                    up_price   = up_p,
-                    down_price = down_p,
-                    liquidity  = liq,
-                    closed     = bool(m.get("closed", False)),
-                )
-            except (ValueError, TypeError, KeyError):
+            resp = requests.get(f"{POLYMARKET_API}/markets", params=params, timeout=10)
+            if not resp.ok:
                 continue
-    except Exception as e:
-        print(f"  [API] Fetch failed: {e}")
+
+            for m in resp.json():
+                try:
+                    question = m.get("question", "")
+                    q_lower  = question.lower()
+                    is_btc    = "bitcoin" in q_lower or "btc" in q_lower
+                    is_updown = ("up or down" in q_lower or "5 min" in q_lower
+                                 or "5-min" in q_lower or "updown" in q_lower)
+                    if not is_btc or not is_updown:
+                        continue
+                    outcomes = m.get("outcomes", [])
+                    prices   = m.get("outcomePrices", [])
+                    if isinstance(outcomes, str): outcomes = json.loads(outcomes)
+                    if isinstance(prices,   str): prices   = json.loads(prices)
+                    if len(prices) != 2:
+                        continue
+                    up_p   = float(prices[0])
+                    down_p = float(prices[1])
+                    liq    = float(m.get("liquidity") or 0)
+                    mid    = str(m.get("id") or m.get("conditionId") or question)
+                    if up_p <= 0 or down_p <= 0:
+                        continue
+                    results[mid] = Market(
+                        market_id  = mid,
+                        name       = question[:60],
+                        up_price   = up_p,
+                        down_price = down_p,
+                        liquidity  = liq,
+                        closed     = bool(m.get("closed", False)),
+                    )
+                except (ValueError, TypeError, KeyError):
+                    continue
+        except Exception as e:
+            print(f"  [API] Fetch failed ({query}): {e}")
     return results
 
 
