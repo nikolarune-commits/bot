@@ -265,7 +265,7 @@ def btc_signal() -> Optional[tuple[str, float]]:
     print(f"  [BTC] Δ={delta:+.3f}%  RSI={rsi:.0f}  EMA={'↑' if ema9>ema21 else '↓'}  "
           f"OBI={obi:+.2f}  score={score:+.0f}  conf={confidence:.0%}  → {direction}")
 
-    if confidence < 0.30:
+    if confidence < 0.50:
         return None   # signals too weak or conflicting
 
     return (direction, confidence)
@@ -606,12 +606,15 @@ def save_state(balance: float, original_balance: float, total_sessions: int, ope
 # ─────────────────────────────────────────────
 
 def run_bot(balance: float, original_balance: float, carried_trades: list[Trade]) -> tuple[float, list[Trade]]:
-    session_start = balance
-    open_trades   = carried_trades   # carry over unresolved trades from last session
+    from datetime import timedelta
+    session_start  = balance
+    open_trades    = carried_trades   # carry over unresolved trades from last session
     all_trades:  list[Trade] = []
-    trade_id_seq  = max((t.trade_id for t in open_trades), default=0)
-    skipped       = 0
-    total_pnl     = 0.0
+    trade_id_seq   = max((t.trade_id for t in open_trades), default=0)
+    skipped        = 0
+    total_pnl      = 0.0
+    consec_losses  = 0               # consecutive losses this session
+    cooldown_until = None            # datetime: no new trades until this passes
 
     if SAVE_CSV:
         csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CSV_FILENAME)
@@ -639,6 +642,14 @@ def run_bot(balance: float, original_balance: float, carried_trades: list[Trade]
                 total_pnl += profit
                 print_resolution(t)
                 all_trades.append(t)
+                if status == "LOSS":
+                    consec_losses += 1
+                    if consec_losses >= 2:
+                        cooldown_until = datetime.now() + timedelta(minutes=5)
+                        print(f"  [STRATEGY] {consec_losses} consecutive losses — pausing new trades for 5 min")
+                else:
+                    consec_losses = 0
+                    cooldown_until = None
                 if SAVE_CSV:
                     append_csv(csv_path, t)
             else:
@@ -672,6 +683,13 @@ def run_bot(balance: float, original_balance: float, carried_trades: list[Trade]
 
         if any(t.market_id == market.market_id for t in open_trades):
             print_skipped("Already in this market")
+            skipped += 1
+            time.sleep(SCAN_INTERVAL)
+            continue
+
+        if cooldown_until and datetime.now() < cooldown_until:
+            remaining = int((cooldown_until - datetime.now()).total_seconds())
+            print_skipped(f"Loss-streak cooldown ({remaining}s remaining)")
             skipped += 1
             time.sleep(SCAN_INTERVAL)
             continue
