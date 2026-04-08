@@ -641,10 +641,12 @@ def load_state() -> dict:
         "total_sessions":   0,
         "open_trades":      [],
         "consec_losses":    0,
+        "cooldown_until":   None,
     }
 
 def save_state(balance: float, original_balance: float, total_sessions: int,
-               open_trades: list, consec_losses: int = 0):
+               open_trades: list, consec_losses: int = 0,
+               cooldown_until: Optional[datetime] = None):
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE)
     with open(path, "w") as f:
         json.dump({
@@ -653,6 +655,7 @@ def save_state(balance: float, original_balance: float, total_sessions: int,
             "total_sessions":   total_sessions,
             "open_trades":      trades_to_json(open_trades),
             "consec_losses":    consec_losses,
+            "cooldown_until":   cooldown_until.isoformat() if cooldown_until else None,
         }, f)
 
 
@@ -680,7 +683,8 @@ def cooldown_for_streak(n: int) -> int:
 # ─────────────────────────────────────────────
 
 def run_bot(balance: float, original_balance: float, carried_trades: list,
-            consec_losses_in: int = 0) -> tuple:
+            consec_losses_in: int = 0,
+            cooldown_until_in: Optional[datetime] = None) -> tuple:
     session_start = balance
     open_trades   = carried_trades
     all_trades    = []
@@ -689,13 +693,14 @@ def run_bot(balance: float, original_balance: float, carried_trades: list,
     session_pnl   = 0.0
     consec_losses = consec_losses_in
 
-    # Restore cooldown if still on a loss streak from last session
-    cooldown_until = None
-    cd_min = cooldown_for_streak(consec_losses)
-    if cd_min > 0:
-        cooldown_until = datetime.now() + timedelta(minutes=cd_min)
-        print(f"  [STRATEGY] Loss streak {consec_losses} carried over"
-              f" — cooldown {cd_min} min")
+    # Restore cooldown timestamp from previous session (only if still in the future)
+    cooldown_until = cooldown_until_in
+    if cooldown_until and datetime.now() >= cooldown_until:
+        cooldown_until = None   # already expired — don't block trading
+    if cooldown_until:
+        remaining_min = int((cooldown_until - datetime.now()).total_seconds() / 60)
+        print(f"  [STRATEGY] Loss streak {consec_losses} — cooldown "
+              f"{remaining_min} min remaining")
 
     if SAVE_CSV:
         csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CSV_FILENAME)
@@ -848,7 +853,7 @@ def run_bot(balance: float, original_balance: float, carried_trades: list,
 
     print_session_summary(balance, session_start, original_balance,
                           all_trades, skipped, consec_losses)
-    return balance, open_trades, consec_losses
+    return balance, open_trades, consec_losses, cooldown_until
 
 
 # ─────────────────────────────────────────────
@@ -868,6 +873,8 @@ if __name__ == "__main__":
         state["original_balance"] = STARTING_BALANCE
 
     consec_losses = state.get("consec_losses", 0)
+    cd_str        = state.get("cooldown_until")
+    cooldown_until = datetime.fromisoformat(cd_str) if cd_str else None
 
     while True:
         streak_str = f"  |  Loss streak: {consec_losses}" if consec_losses > 0 else ""
@@ -877,9 +884,10 @@ if __name__ == "__main__":
               f"  |  Open: {len(open_trades)}{streak_str}")
         print(f"  {'═' * 50}")
 
-        balance, open_trades, consec_losses = run_bot(
-            balance, state["original_balance"], open_trades, consec_losses)
-        save_state(balance, state["original_balance"], session, open_trades, consec_losses)
+        balance, open_trades, consec_losses, cooldown_until = run_bot(
+            balance, state["original_balance"], open_trades, consec_losses, cooldown_until)
+        save_state(balance, state["original_balance"], session, open_trades,
+                   consec_losses, cooldown_until)
         session += 1
         print("  Restarting in 5 seconds...\n")
         time.sleep(5)
