@@ -1,0 +1,25 @@
+# Bot state — lives on the persistent disk, never commit
+state.json
+trade_log.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Secrets
+.env
+
+# Editor / tooling
+.vscode/
+.idea/
+.claude/
+
+# Local helpers (not used in production)
+run_bot.bat
+
+# OS
+.DS_Store
+Thumbs.db

@@ -4,3 +4,12 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python arb_bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.10
+      - key: STATE_DIR
+        value: /data
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 1

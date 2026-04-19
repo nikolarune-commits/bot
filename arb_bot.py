@@ -11,7 +11,7 @@ import csv
 import os
 import json
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -40,6 +40,14 @@ CSV_FILENAME       = "trade_log.csv"
 POLYMARKET_API     = "https://gamma-api.polymarket.com"
 BINANCE_API        = "https://api.binance.com/api/v3"
 STATE_FILE         = "state.json"
+
+
+def _data_path(filename: str) -> str:
+    """Resolve a persistent-storage path. On Render, STATE_DIR points at a
+    mounted disk; locally we fall back to the script directory."""
+    base = os.environ.get("STATE_DIR") or os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, filename)
 
 
 # ─────────────────────────────────────────────
@@ -335,6 +343,21 @@ def _parse_market(m: dict) -> Optional[Market]:
         down_p = float(prices[1])
         if up_p <= 0 or down_p <= 0:
             return None
+
+        # Reject markets that have already ended. Prevents the bot from
+        # locking onto a stale market whose prices/liquidity no longer move.
+        end_raw = m.get("endDate") or m.get("end_date_iso") or m.get("endTime")
+        if end_raw:
+            try:
+                end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=timezone.utc)
+                # 2-minute grace for clock skew; anything older is stale.
+                if end_dt < datetime.now(timezone.utc) - timedelta(minutes=2):
+                    return None
+            except (ValueError, TypeError):
+                pass
+
         mid = str(m.get("id") or m.get("conditionId") or question)
         return Market(
             market_id  = mid,
@@ -404,14 +427,16 @@ def _fetch_markets() -> dict[str, Market]:
 
 
 def refresh_cache(scan_num: int) -> dict[str, Market]:
-    """Refresh market cache every API_REFRESH_SCANS iterations."""
+    """Refresh market cache every API_REFRESH_SCANS iterations.
+    Always replaces the cache (even when empty) so an empty fetch clears
+    any stale entries rather than leaving the bot stuck on a dead market.
+    """
     global _market_cache, _cache_last_scan
     if scan_num - _cache_last_scan >= API_REFRESH_SCANS or not _market_cache:
         markets = _fetch_markets()
-        if markets:
-            _market_cache = markets
-            active = sum(1 for m in markets.values() if not m.closed)
-            print(f"  [API] {active} active BTC market(s) loaded")
+        _market_cache = markets
+        active = sum(1 for m in markets.values() if not m.closed)
+        print(f"  [API] {active} active BTC market(s) loaded")
         _cache_last_scan = scan_num
     return _market_cache
 
@@ -631,7 +656,7 @@ def trades_from_json(data: list) -> list:
     return result
 
 def load_state() -> dict:
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE)
+    path = _data_path(STATE_FILE)
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
@@ -647,7 +672,7 @@ def load_state() -> dict:
 def save_state(balance: float, original_balance: float, total_sessions: int,
                open_trades: list, consec_losses: int = 0,
                cooldown_until: Optional[datetime] = None):
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE)
+    path = _data_path(STATE_FILE)
     with open(path, "w") as f:
         json.dump({
             "balance":          balance,
@@ -703,7 +728,7 @@ def run_bot(balance: float, original_balance: float, carried_trades: list,
               f"{remaining_min} min remaining")
 
     if SAVE_CSV:
-        csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CSV_FILENAME)
+        csv_path = _data_path(CSV_FILENAME)
         init_csv(csv_path)
 
     print(f"  Balance  : ${balance:.2f}")
