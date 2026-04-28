@@ -344,19 +344,27 @@ def _parse_market(m: dict) -> Optional[Market]:
         if up_p <= 0 or down_p <= 0:
             return None
 
-        # Reject markets that have already ended. Prevents the bot from
-        # locking onto a stale market whose prices/liquidity no longer move.
+        # Reject already-closed markets immediately.
+        if bool(m.get("closed", False)):
+            return None
+
+        # STRICT freshness check: endDate MUST be present AND in the future.
+        # Polymarket returns null/missing endDate for resolved-but-still-listed
+        # markets, which the bot was happily picking up and "trading" on
+        # phantom liquidity. Require a real future endDate to consider live.
         end_raw = m.get("endDate") or m.get("end_date_iso") or m.get("endTime")
-        if end_raw:
-            try:
-                end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
-                if end_dt.tzinfo is None:
-                    end_dt = end_dt.replace(tzinfo=timezone.utc)
-                # 2-minute grace for clock skew; anything older is stale.
-                if end_dt < datetime.now(timezone.utc) - timedelta(minutes=2):
-                    return None
-            except (ValueError, TypeError):
-                pass
+        if not end_raw:
+            return None
+        try:
+            end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return None
+        # Must be at least 30s in the future. Anything sooner is about to
+        # resolve and not worth opening on; anything past is stale.
+        if end_dt < datetime.now(timezone.utc) + timedelta(seconds=30):
+            return None
 
         mid = str(m.get("id") or m.get("conditionId") or question)
         return Market(
@@ -365,7 +373,7 @@ def _parse_market(m: dict) -> Optional[Market]:
             up_price   = up_p,
             down_price = down_p,
             liquidity  = float(m.get("liquidity") or 0),
-            closed     = bool(m.get("closed", False)),
+            closed     = False,
         )
     except (ValueError, TypeError, KeyError):
         return None
@@ -657,6 +665,12 @@ def trades_from_json(data: list) -> list:
 
 def load_state() -> dict:
     path = _data_path(STATE_FILE)
+    # Set STATE_RESET=1 in the environment to wipe state on the next start.
+    # Use this once when stored state is corrupt (e.g. fake balance from a bug)
+    # then unset it before the following deploy.
+    if os.environ.get("STATE_RESET") == "1" and os.path.exists(path):
+        os.remove(path)
+        print("  [STATE] STATE_RESET=1 — wiped existing state.json")
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
